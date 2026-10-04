@@ -59,10 +59,9 @@ small{color:var(--mut)}
     <label>Model</label>
     <div class="row">
       <select id="model">
-        <option>llama-3.3-70b-versatile</option>
         <option>openai/gpt-oss-120b</option>
+        <option>qwen/qwen3.6-27b</option>
         <option>openai/gpt-oss-20b</option>
-        <option>llama-3.1-8b-instant</option>
       </select>
     </div>
     <label>…or type any Groq model id (overrides the list)</label>
@@ -135,7 +134,7 @@ $("temp").addEventListener("input",e=>$("tv").textContent=e.target.value);
 for(const k of ["tf_theme","tf_name","tf_model"]){}
 if(localStorage.getItem("tf_theme"))$("theme").value=localStorage.getItem("tf_theme");
 $("theme").addEventListener("input",e=>localStorage.setItem("tf_theme",e.target.value));
-if(localStorage.getItem("tf_model"))$("model").value=localStorage.getItem("tf_model");
+if(localStorage.getItem("tf_model")&&!/llama/i.test(localStorage.getItem("tf_model")))$("model").value=localStorage.getItem("tf_model");
 $("model").addEventListener("change",e=>localStorage.setItem("tf_model",e.target.value));
 
 function allNames(){return [...BLOCKS.map(n=>"block/"+n),...ITEMS.map(n=>"item/"+n),...Object.keys(tex).filter(n=>!BLOCKS.includes(n.slice(6))&&!ITEMS.includes(n.slice(5)))]}
@@ -172,16 +171,21 @@ const modelId=()=>$("modelCustom").value.trim()||$("model").value;
 async function groq(messages,{json=true}={}){
   const key=$("key").value.trim();
   if(!key)throw new Error("Enter your Groq API key first");
-  let useJson=json;
+  let useJson=json,useReason=true;
   for(let attempt=0;attempt<5;attempt++){
     if(stopFlag)throw new Error("Stopped");
-    const body={model:modelId(),messages,temperature:+$("temp").value,max_tokens:2500};
+    const body={model:modelId(),messages,temperature:+$("temp").value,max_tokens:4096};
+    if(useReason){if(/gpt-oss/i.test(modelId())){body.reasoning_effort="low";body.include_reasoning=false}else if(/qwen/i.test(modelId())){body.reasoning_effort="none"}}
     if(useJson)body.response_format={type:"json_object"};
     let res;
+    const ac=new AbortController(),to=setTimeout(()=>ac.abort(),75000);
     try{
       res=await fetch("https://api.groq.com/openai/v1/chat/completions",{
-        method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+key},body:JSON.stringify(body)});
-    }catch(e){throw new Error(`Couldn't reach api.groq.com (${e.message}). Page origin: ${location.protocol}//${location.host||"(none)"}. Causes: opened inside a sandboxed preview/in-app viewer, an ad/privacy blocker or VPN/firewall blocking api.groq.com, or a content:// URL. Try a normal desktop browser tab or host the file on https (GitHub Pages).`)}
+        method:"POST",signal:ac.signal,headers:{"Content-Type":"application/json","Authorization":"Bearer "+key},body:JSON.stringify(body)});
+      clearTimeout(to);
+    }catch(e){
+      clearTimeout(to);
+      if(e.name==="AbortError"){log("Request timed out after 75s (model too slow) – retrying…");continue}throw new Error(`Couldn't reach api.groq.com (${e.message}). Page origin: ${location.protocol}//${location.host||"(none)"}. Causes: opened inside a sandboxed preview/in-app viewer, an ad/privacy blocker or VPN/firewall blocking api.groq.com, or a content:// URL. Try a normal desktop browser tab or host the file on https (GitHub Pages).`)}
     if(res.status===429||res.status>=500){
       const ra=parseFloat(res.headers.get("retry-after"))||Math.min(4*(attempt+1),20);
       log(`Rate limited/busy (${res.status}) – waiting ${ra.toFixed(0)}s…`);await sleep(ra*1000+250);continue;
@@ -189,7 +193,9 @@ async function groq(messages,{json=true}={}){
     const data=await res.json().catch(()=>({}));
     if(!res.ok){
       const msg=data.error?.message||res.statusText;
+      if(res.status===400&&useReason&&/reasoning|include_reasoning/i.test(msg)){useReason=false;log("Model rejected reasoning option – retrying without it");continue}
       if(res.status===400&&useJson&&/response_format|json/i.test(msg)){useJson=false;continue}
+      if(/decommission|does not exist|no longer supported/i.test(msg))throw new Error(`Groq says this model is retired or unavailable (${modelId()}). Click "Test connection" to load the models your account can use.`);
       throw new Error(`Groq ${res.status}: ${msg}`);
     }
     return data.choices?.[0]?.message?.content||"";
@@ -197,6 +203,7 @@ async function groq(messages,{json=true}={}){
   throw new Error("Groq kept failing after retries");
 }
 function parseJSON(t){
+  t=t.replace(/<think>[\s\S]*?<\/think>/g,"");
   const a=t.indexOf("{"),b=t.lastIndexOf("}");
   if(a<0||b<0)throw new Error("No JSON in reply");
   return JSON.parse(t.slice(a,b+1));
@@ -233,6 +240,10 @@ function describe(name){
 async function genTexture(name){
   const N=+$("res").value, t=tex[name]||(tex[name]={});
   t.status="working";t.err=null;draw(name);
+  const t0=Date.now(),tick=setInterval(()=>{const st=document.querySelector(`[data-n="${name}"] .st`);if(st&&t.status==="working")st.textContent="generating… "+Math.round((Date.now()-t0)/1000)+"s"},1000);
+  try{await genTextureInner(name,N,t)}finally{clearInterval(tick)}
+}
+async function genTextureInner(name,N,t){
   const palRule=stylePalette?`Use ONLY colors from this shared palette (you may add up to 3 extra shades if needed): ${stylePalette.palette.join(", ")}. Style notes: ${stylePalette.notes}`:"Pick your own small palette (6-12 colors).";
   const prompt=`Theme: "${$("theme").value.trim()}"\nDraw ${describe(name)}\n${palRule}\n${t.note?`Extra direction: ${t.note}\n`:""}\nCanvas: exactly ${N} columns by ${N} rows.\nReply with JSON only:\n{"palette":["#rrggbb",...up to 16 colors],"rows":[${N} strings, each exactly ${N} characters]}\nEach character in a row is a palette index in hex (0-9,a-f) or '.' for transparent. Row 0 is the top. Use shading, highlights and texture noise like vanilla Minecraft. Count characters carefully.`;
   const out=await groq([
@@ -348,7 +359,7 @@ $("test").onclick=async()=>{
     if(!mr.ok)throw new Error("Groq "+mr.status+": "+(md.error?.message||mr.statusText));
     const ids=(md.data||[]).map(m=>m.id).filter(id=>!/whisper|tts|guard|embed|orpheus|playai/i.test(id)).sort();
     if(ids.length){const sel=$("model"),cur=sel.value;sel.innerHTML=ids.map(i=>`<option>${i}</option>`).join("");
-      sel.value=ids.includes(cur)?cur:(ids.find(i=>/llama-3\.3-70b|gpt-oss-120b/.test(i))||ids[0]);log("Key OK. Loaded "+ids.length+" models from your account.")}
+      sel.value=ids.includes(cur)?cur:(ids.find(i=>/gpt-oss-120b|qwen3\.6/.test(i))||ids[0]);log("Key OK. Loaded "+ids.length+" models from your account.")}
     const r=await groq([{role:"user",content:'Reply with JSON: {"ok":true}'}]);
     log("Model "+modelId()+" replied: "+r.trim().slice(0,60));banner("Connection OK – model "+modelId()+" works.");
   }catch(e){log("Test failed: "+e.message);banner(e.message,true)}
